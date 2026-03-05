@@ -1,0 +1,154 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy_and_update:
+    name: Deploy VPN and Update DNS
+    runs-on: ubuntu-latest
+    environment:
+      name: dns-approval # The whole process waits for your one-click approval
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # --- SECTION 1: DEPLOY SERVER ---
+
+      - name: Configure AWS Credentials (VPN Account)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_VPN_ACCOUNT }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_VPN_ACCOUNT }}
+          aws-region: ${{ secrets.AWS_REGION_VPN_ACCOUNT }}
+
+      - name: Generate Temporary SSH Key
+        id: ssh_key
+        run: |
+          ssh-keygen -t ed25519 -N "" -f github_action_key
+          echo "pub_key=$(cat github_action_key.pub)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy CloudFormation Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name vpn-server-stack \
+            --template-file vpn-ec2.yaml \
+            --parameter-overrides \
+                VpnDomainName="${{ secrets.VPN_DOMAIN_NAME }}" \
+                VpnUser="${{ secrets.VPN_USER }}" \
+                VpnPassword="${{ secrets.VPN_PASSWORD }}" \
+                SshPublicKey="${{ secrets.SSH_PUBLIC_KEY }}" \
+                ActionSshPublicKey="${{ steps.ssh_key.outputs.pub_key }}" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Get Public IP
+        id: get_ip
+        run: |
+          PUBLIC_IP=$(aws cloudformation describe-stacks \
+            --stack-name vpn-server-stack \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" \
+            --output text)
+          
+          if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" == "None" ]; then
+            echo "❌ Error: Could not retrieve Public IP from CloudFormation stack."
+            exit 1
+          fi
+          
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$PUBLIC_IP"
+          echo "✅ Successfully captured Public IP."
+
+      - name: Retrieve OpenVPN Profile
+        env:
+          PUBLIC_IP: ${{ steps.get_ip.outputs.public_ip }}
+          VPN_USER: ${{ secrets.VPN_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          cp github_action_key ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          
+          # Disable strict host key checking
+          cat <<EOF > ~/.ssh/config
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+          EOF
+          
+          echo "Waiting for CloudFormation UserData to finish (this can take 5-10 minutes on t2.micro)..."
+          
+          # Poll every 20 seconds for up to 30 attempts
+          MAX_RETRIES=30
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "⏳ Attempt $((RETRY_COUNT+1))/$MAX_RETRIES: Checking for profile..."
+            if ssh -q -i ~/.ssh/id_ed25519 -o ConnectTimeout=5 ec2-user@$PUBLIC_IP "test -f /home/ec2-user/$VPN_USER.ovpn" 2>/dev/null; then
+              echo "✅ OpenVPN Profile is ready!"
+              break
+            fi
+            sleep 20
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "❌ Timeout: The .ovpn file was not generated in time."
+            exit 1
+          fi
+          
+          # Download the profile
+          scp -q -i ~/.ssh/id_ed25519 ec2-user@$PUBLIC_IP:/home/ec2-user/$VPN_USER.ovpn ./$VPN_USER.ovpn 2>/dev/null
+
+      - name: Upload OpenVPN Profile to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVPN-Profile
+          path: ./${{ secrets.VPN_USER }}.ovpn
+
+      # --- SECTION 2: UPDATE DNS ---
+
+      - name: Configure AWS Credentials (Main Account)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_MAIN_ACCOUNT }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_MAIN_ACCOUNT }}
+          aws-region: ${{ secrets.AWS_REGION_MAIN_ACCOUNT }}
+
+      - name: Update Route53 Record
+        env:
+          PUBLIC_IP: ${{ steps.get_ip.outputs.public_ip }}
+          DOMAIN_NAME: ${{ secrets.VPN_DOMAIN_NAME }}
+          HOSTED_ZONE_ID: ${{ secrets.DNS_HOSTED_ZONE_ID }}
+        run: |
+          if [ -z "$PUBLIC_IP" ]; then
+            echo "❌ Error: Public IP is missing."
+            exit 1
+          fi
+          
+          echo "::add-mask::$PUBLIC_IP"
+          
+          cat <<EOF > route53-change.json
+          {
+            "Comment": "Update VPN DNS record",
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "$DOMAIN_NAME",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "$PUBLIC_IP"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --change-batch file://route53-change.json
+          echo "✅ DNS updated successfully."

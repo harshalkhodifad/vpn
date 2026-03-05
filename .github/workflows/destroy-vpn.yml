@@ -1,0 +1,83 @@
+name: Destroy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  delete_dns:
+    name: Delete DNS Entry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials (VPN Account)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_VPN_ACCOUNT }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_VPN_ACCOUNT }}
+          aws-region: ${{ secrets.AWS_REGION_VPN_ACCOUNT }}
+
+      - name: Get EC2 Public IP
+        id: get_ip
+        run: |
+          PUBLIC_IP=$(aws cloudformation describe-stacks \
+            --stack-name vpn-server-stack \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" \
+            --output text 2>/dev/null || echo "")
+          echo "::add-mask::$PUBLIC_IP"
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials (Main Account)
+        if: steps.get_ip.outputs.public_ip != ''
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_MAIN_ACCOUNT }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_MAIN_ACCOUNT }}
+          aws-region: ${{ secrets.AWS_REGION_MAIN_ACCOUNT }}
+
+      - name: Delete Route53 Record
+        if: steps.get_ip.outputs.public_ip != ''
+        env:
+          PUBLIC_IP: ${{ steps.get_ip.outputs.public_ip }}
+          DOMAIN_NAME: ${{ secrets.VPN_DOMAIN_NAME }}
+          HOSTED_ZONE_ID: ${{ secrets.DNS_HOSTED_ZONE_ID }}
+        run: |
+          cat <<EOF > route53-delete.json
+          {
+            "Comment": "Delete VPN DNS record",
+            "Changes": [
+              {
+                "Action": "DELETE",
+                "ResourceRecordSet": {
+                  "Name": "$DOMAIN_NAME",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "$PUBLIC_IP"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+          EOF
+          
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id $HOSTED_ZONE_ID \
+            --change-batch file://route53-delete.json || echo "DNS record deletion failed or already deleted."
+
+  destroy_vpn_server:
+    name: Destroy VPN Infrastructure
+    runs-on: ubuntu-latest
+    needs: delete_dns
+    steps:
+      - name: Configure AWS Credentials (VPN Account)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_VPN_ACCOUNT }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_VPN_ACCOUNT }}
+          aws-region: ${{ secrets.AWS_REGION_VPN_ACCOUNT }}
+
+      - name: Destroy CloudFormation Stack
+        run: |
+          aws cloudformation delete-stack --stack-name vpn-server-stack
+          aws cloudformation wait stack-delete-complete --stack-name vpn-server-stack

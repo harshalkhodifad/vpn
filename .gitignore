@@ -1,0 +1,13 @@
+# Environment files
+.env
+*.env
+
+# SSH Keys
+*.pem
+
+# IDEs
+.idea/
+.vscode/
+
+# GitHub Actions generated temp files
+route53-change.json
